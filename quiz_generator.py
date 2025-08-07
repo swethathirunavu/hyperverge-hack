@@ -1,4 +1,4 @@
-import openai
+iimport openai
 import json
 import random
 from typing import List, Dict, Any
@@ -115,4 +115,192 @@ Follow these guidelines:
 
         difficulty_prompts = {
             'easy': base_prompt + """
-- Use simple, straightforwar
+- Use simple, straightforward language
+- Focus on basic facts and definitions
+- Test direct recall of information
+- Avoid complex analysis or inference""",
+            
+            'medium': base_prompt + """
+- Test comprehension and application
+- Include some analytical thinking
+- Mix factual and conceptual questions
+- Require understanding of relationships between concepts""",
+            
+            'hard': base_prompt + """
+- Require deep analysis and critical thinking
+- Test ability to synthesize information
+- Include complex scenarios and edge cases
+- Challenge students to apply concepts in new contexts"""
+        }
+        
+        return difficulty_prompts.get(difficulty, difficulty_prompts['medium'])
+    
+    def _build_prompt(self, chunk_text: str, difficulty: str, num_questions: int) -> str:
+        """Build the main prompt for question generation"""
+        return f"""
+Based on the following text, generate exactly {num_questions} multiple choice question(s).
+
+TEXT:
+{chunk_text}
+
+FORMAT YOUR RESPONSE AS JSON:
+{{
+    "questions": [
+        {{
+            "question": "Your question here?",
+            "options": ["Option A", "Option B", "Option C", "Option D"],
+            "correct_answer": 0,
+            "explanation": "Brief explanation of why this is correct",
+            "difficulty": "{difficulty}",
+            "topic": "Main topic/concept being tested"
+        }}
+    ]
+}}
+
+Requirements:
+- Generate exactly {num_questions} question(s)
+- Make sure correct_answer is the index (0-3) of the correct option
+- Keep questions clear and concise
+- Ensure all options are plausible
+- Include helpful explanations
+- Focus on the most important concepts in the text
+"""
+    
+    def _parse_questions(self, questions_text: str, chunk: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Parse questions from GPT response"""
+        try:
+            # Try to extract JSON from the response
+            start_idx = questions_text.find('{')
+            end_idx = questions_text.rfind('}') + 1
+            
+            if start_idx == -1 or end_idx == 0:
+                raise ValueError("No JSON found in response")
+            
+            json_text = questions_text[start_idx:end_idx]
+            parsed = json.loads(json_text)
+            
+            questions = []
+            for q_data in parsed.get('questions', []):
+                question = {
+                    'question': q_data.get('question', ''),
+                    'options': q_data.get('options', []),
+                    'correct_answer': q_data.get('correct_answer', 0),
+                    'explanation': q_data.get('explanation', ''),
+                    'difficulty': q_data.get('difficulty', 'medium'),
+                    'topic': q_data.get('topic', 'General'),
+                    'chunk_index': chunk['index'],
+                    'source': self._get_source_info(chunk),
+                    'created_at': datetime.now().isoformat()
+                }
+                
+                # Validate question
+                if self._validate_question(question):
+                    questions.append(question)
+            
+            return questions
+            
+        except json.JSONDecodeError as e:
+            st.error(f"Failed to parse JSON response: {str(e)}")
+            return self._fallback_parse(questions_text, chunk)
+        except Exception as e:
+            st.error(f"Error parsing questions: {str(e)}")
+            return []
+    
+    def _fallback_parse(self, text: str, chunk: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Fallback parsing method if JSON parsing fails"""
+        # This is a simple fallback - in practice, you might want more sophisticated parsing
+        questions = []
+        
+        # Try to extract questions using patterns
+        lines = text.split('\n')
+        current_question = None
+        
+        for line in lines:
+            line = line.strip()
+            if line.endswith('?'):
+                # Likely a question
+                current_question = {
+                    'question': line,
+                    'options': [],
+                    'correct_answer': 0,
+                    'explanation': 'Generated from text content',
+                    'difficulty': 'medium',
+                    'topic': 'General',
+                    'chunk_index': chunk['index'],
+                    'source': self._get_source_info(chunk)
+                }
+            elif line.startswith(('A.', 'B.', 'C.', 'D.', 'A)', 'B)', 'C)', 'D)')):
+                # Likely an option
+                if current_question:
+                    option_text = line[2:].strip()
+                    current_question['options'].append(option_text)
+                    
+                    if len(current_question['options']) == 4:
+                        questions.append(current_question)
+                        current_question = None
+        
+        return questions
+    
+    def _validate_question(self, question: Dict[str, Any]) -> bool:
+        """Validate that a question is properly formatted"""
+        required_fields = ['question', 'options', 'correct_answer']
+        
+        for field in required_fields:
+            if field not in question:
+                return False
+        
+        # Check question content
+        if not question['question'] or len(question['question'].strip()) < 10:
+            return False
+        
+        # Check options
+        if len(question['options']) != 4:
+            return False
+        
+        for option in question['options']:
+            if not option or len(option.strip()) < 2:
+                return False
+        
+        # Check correct answer
+        if not isinstance(question['correct_answer'], int) or not (0 <= question['correct_answer'] <= 3):
+            return False
+        
+        return True
+    
+    def _get_source_info(self, chunk: Dict[str, Any]) -> str:
+        """Get source information for citation"""
+        if chunk['source_type'] == 'pdf':
+            pages = chunk.get('pages_covered', [1])
+            page_str = f"page {pages[0]}" if len(pages) == 1 else f"pages {min(pages)}-{max(pages)}"
+            return f"Document {page_str}, chunk {chunk['index'] + 1}"
+        else:
+            paragraphs = chunk.get('paragraphs_covered', [1])
+            para_str = f"paragraph {paragraphs[0]}" if len(paragraphs) == 1 else f"paragraphs {min(paragraphs)}-{max(paragraphs)}"
+            return f"Document {para_str}, chunk {chunk['index'] + 1}"
+    
+    def generate_follow_up_questions(self, incorrect_answers: List[Dict[str, Any]], chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Generate follow-up questions for incorrect answers"""
+        if not incorrect_answers:
+            return []
+        
+        # Find relevant chunks for incorrect topics
+        topics = [q.get('topic', 'General') for q in incorrect_answers]
+        relevant_chunks = []
+        
+        for chunk in chunks:
+            chunk_text_lower = chunk['text'].lower()
+            for topic in topics:
+                if topic.lower() in chunk_text_lower:
+                    relevant_chunks.append(chunk)
+                    break
+        
+        if not relevant_chunks:
+            relevant_chunks = chunks[:2]  # Use first 2 chunks as fallback
+        
+        # Generate new questions focusing on the topics they got wrong
+        follow_up_questions = []
+        for chunk in relevant_chunks[:2]:  # Limit to 2 chunks
+            questions = self._generate_questions_for_chunk(chunk, 'easy', 2)
+            follow_up_questions.extend(questions)
+        
+        return follow_up_questions[:5]  # Limit to 5 follow-up questions
